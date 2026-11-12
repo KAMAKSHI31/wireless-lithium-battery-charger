@@ -1,0 +1,147 @@
+
+#include <stdio.h>
+#include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2c_master.h"
+#include "esp_log.h"
+
+#define TAG "WIRELESS_BMS"
+
+#define I2C_PORT       I2C_NUM_0
+#define SDA_PIN        21
+#define SCL_PIN        22
+
+#define INA219_ADDRESS 0x40
+#define TEMP_WARNING  40.0f
+
+static i2c_master_bus_handle_t bus_handle;
+static i2c_master_dev_handle_t ina219_handle;
+
+/* Initialize I2C */
+static esp_err_t i2c_init(void)
+{
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_PORT,
+        .sda_io_num = SDA_PIN,
+        .scl_io_num = SCL_PIN,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true
+    };
+
+    ESP_ERROR_CHECK(
+        i2c_new_master_bus(&bus_config, &bus_handle)
+    );
+
+    i2c_device_config_t dev_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = INA219_ADDRESS,
+        .scl_speed_hz = 100000
+    };
+
+    return i2c_master_bus_add_device(
+        bus_handle, &dev_config, &ina219_handle
+    );
+}
+
+/* Read INA219 register */
+static esp_err_t read_register(uint8_t reg, uint16_t *value)
+{
+    uint8_t data[2];
+
+    esp_err_t result = i2c_master_transmit_receive(
+        ina219_handle, &reg, 1, data, 2, 1000
+    );
+
+    if (result == ESP_OK) {
+        *value = ((uint16_t)data[0] << 8) | data[1];
+    }
+
+    return result;
+}
+
+/* Configure INA219 */
+static esp_err_t ina219_init(void)
+{
+    uint8_t config[] = {0x00, 0x39, 0x9F};
+
+    return i2c_master_transmit(
+        ina219_handle, config, sizeof(config), 1000
+    );
+}
+
+/* Read battery bus voltage */
+static float read_voltage(void)
+{
+    uint16_t raw;
+
+    if (read_register(0x02, &raw) != ESP_OK)
+        return -1.0f;
+
+    return (float)(raw >> 3) * 0.004f;
+}
+
+/* Read shunt voltage */
+static float read_shunt_voltage(void)
+{
+    uint16_t raw;
+
+    if (read_register(0x01, &raw) != ESP_OK)
+        return -1.0f;
+
+    return (float)(int16_t)raw * 0.01f;
+}
+
+/*
+ * Current conversion depends on the actual INA219
+ * calibration register and shunt resistor.
+ * Configure and calibrate this for your hardware
+ * before using current values.
+ */
+static float read_current(void)
+{
+    uint16_t raw;
+
+    if (read_register(0x04, &raw) != ESP_OK)
+        return -1.0f;
+
+    return (float)(int16_t)raw;
+}
+
+/* Main monitoring task */
+void app_main(void)
+{
+    ESP_ERROR_CHECK(i2c_init());
+    ESP_ERROR_CHECK(ina219_init());
+
+    ESP_LOGI(TAG, "Wireless Battery Monitoring Started");
+
+    while (1)
+    {
+        float voltage = read_voltage();
+        float shunt_mv = read_shunt_voltage();
+        float current_raw = read_current();
+
+        if (voltage < 0 || shunt_mv < 0 || current_raw < 0)
+        {
+            ESP_LOGE(TAG, "INA219 sensor reading error");
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Battery Voltage: %.3f V", voltage);
+            ESP_LOGI(TAG, "Shunt Voltage: %.2f mV", shunt_mv);
+            ESP_LOGI(TAG, "Current Register Value: %.0f", current_raw);
+
+            ESP_LOGI(TAG, "Power calculation requires calibrated current");
+        }
+
+        /*
+         * DS18B20 temperature acquisition is not implemented
+         * in this I2C-only example. It uses a separate
+         * OneWire interface and needs its own driver.
+         */
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
